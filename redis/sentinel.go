@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 )
 
 type SentinelClient struct {
+	mu      sync.Mutex
 	SentinelAddrs  []string
 	net            string
 	Conn           Conn
@@ -124,9 +126,11 @@ func (sc *SentinelClient) Do(cmd string, args ...interface{}) (interface{}, erro
 // been tried. Note that the most likely scenario is that dial() will exhaust
 // sentinels until a working one is found.
 func (sc *SentinelClient) do(addrs []string, cmd string, args ...interface{}) (interface{}, error) {
+	sc.mu.Lock()
 	res, err := sc.Conn.Do(cmd, args...)
 	if err != nil && res == nil { // indicates connection error of some sort
 		sc.Conn.Close()
+		sc.mu.Unlock()
 		err, leftovers := sc.dial(addrs)
 		if err != nil {
 			return nil, err
@@ -134,6 +138,7 @@ func (sc *SentinelClient) do(addrs []string, cmd string, args ...interface{}) (i
 			return sc.do(leftovers, cmd, args...)
 		}
 	} else {
+		sc.mu.Unlock()
 		return res, err
 	}
 }
@@ -190,17 +195,18 @@ func SlaveReadFlags(slaveMap map[string]string) map[string]bool {
 // for contacting the sentinels.
 //
 // DialMaster returns immediately on failure.
-func (sc *SentinelClient) DialMaster(name string) (Conn, error) {
+func (sc *SentinelClient) DialMaster(name string, options ...DialOption) (Conn, error) {
 	masterAddr, err := sc.QueryConfForMaster(name)
 
 	if err != nil {
 		return nil, err
 	}
 
-	return Dial(sc.net, masterAddr)
+	return Dial(sc.net, masterAddr, options...)
 }
 
 var NoSlavesRemaining error = errors.New("No connected slaves with active master-link available")
+var InternalError error = errors.New("Internal error")
 
 // DialSlave returns a connection to a slave. This routine mandates that the
 // slave have an active link to the master, and not be currently flagged as
@@ -211,7 +217,7 @@ var NoSlavesRemaining error = errors.New("No connected slaves with active master
 // exhausted, at which point NoSlavesRemaining is returned.
 //
 // To change this behavior, implement a dialer using QueryConfForSlaves.
-func (sc *SentinelClient) DialSlave(name string) (Conn, error) {
+func (sc *SentinelClient) DialSlave(name string, options ...DialOption) (Conn, error) {
 	slaves, err := sc.QueryConfForSlaves(name)
 	if err != nil {
 		return nil, err
@@ -220,7 +226,7 @@ func (sc *SentinelClient) DialSlave(name string) (Conn, error) {
 		index := rand.Int31n(int32(len(slaves)))
 		flags := SlaveReadFlags(slaves[index])
 		if slaves[index]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
-			conn, err := Dial(sc.net, SlaveAddr(slaves[index]))
+			conn, err := Dial(sc.net, SlaveAddr(slaves[index]), options...)
 			if err == nil {
 				return conn, err
 			}
@@ -230,13 +236,46 @@ func (sc *SentinelClient) DialSlave(name string) (Conn, error) {
 	return nil, NoSlavesRemaining
 }
 
+// DialAny returns a connection to a random redis instance. This routine
+// mandates that the slave have an active link to the master, and not be
+// currently flagged as disconnected. Then a slave is randomly selected
+// from the list.
+func (sc *SentinelClient) DialAny(name string, options ...DialOption) (Conn, error) {
+	slaves, err := sc.QueryConfForSlaves(name)
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		index := rand.Int31n(int32(len(slaves) + 1))
+		// This is the master
+		if int(index) == len(slaves) {
+			return sc.DialMaster(name, options...)
+		}
+
+		flags := SlaveReadFlags(slaves[index])
+		if slaves[index]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+			conn, err := Dial(sc.net, SlaveAddr(slaves[index]), options...)
+			if err == nil {
+				return conn, err
+			}
+		}
+		slaves = append(slaves[:index], slaves[index+1:]...)
+	}
+	return nil, InternalError
+}
+
 // Exposes the Close of the underlying Conn
 func (sc *SentinelClient) Close() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	return sc.Conn.Close()
 }
 
 // Exposes the Err of the underlying Conn
 func (sc *SentinelClient) Err() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	return sc.Conn.Err()
 }
 
@@ -247,9 +286,11 @@ func (sc *SentinelClient) Send(commandName string, args ...interface{}) error {
 }
 
 func (sc *SentinelClient) send(addrs []string, commandName string, args ...interface{}) error {
+	sc.mu.Lock()
 	err := sc.Conn.Send(commandName, args...)
 	if err != nil {
 		sc.Conn.Close()
+		sc.mu.Unlock()
 		err, leftovers := sc.dial(addrs)
 		if err != nil {
 			return err
@@ -257,6 +298,7 @@ func (sc *SentinelClient) send(addrs []string, commandName string, args ...inter
 			return sc.send(leftovers, commandName, args...)
 		}
 	}
+	sc.mu.Unlock()
 	return nil
 }
 
@@ -266,6 +308,8 @@ func (sc *SentinelClient) send(addrs []string, commandName string, args ...inter
 // subsequent calls to Send or Do, or through intermediate calls to Dial,
 // if fallback behavior is required due to a broken connection.
 func (sc *SentinelClient) Flush() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	return sc.Conn.Flush()
 }
 
@@ -279,6 +323,8 @@ func (sc *SentinelClient) Flush() error {
 // Do will guarantee that the sending and receiving steps occur on the
 // same connection.
 func (sc *SentinelClient) Receive() (reply interface{}, err error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	return sc.Conn.Receive()
 }
 

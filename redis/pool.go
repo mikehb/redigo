@@ -382,7 +382,8 @@ func (p *Pool) putCommon(err error, c Conn, forceClose bool) error {
 // contacted, it may be impossible to dial for some time. The
 // SentinelClient should automatically recover once a sentinel returns.
 type SentinelAwarePool struct {
-	Pool
+	Pool						// redis pool for master redis
+	ReadPool Pool				// redis pool for any redis instance
 	// TestOnReturn is a user-supplied function to test a connection before
 	// returning it to the pool. Like TestOnBorrow, TestOnReturn will close the
 	// connection if an error is observed. It is strongly suggested to test the
@@ -400,6 +401,16 @@ func (sap *SentinelAwarePool) UpdateMaster(addr string) {
 	if addr != sap.masterAddr {
 		sap.masterAddr = addr
 		sap.closeAll()
+		sap.ReadPool.closeAll()
+	}
+}
+
+// Get returns a redis connection to either master redis or any redis instance
+func (sap *SentinelAwarePool) Get(isWrite bool) Conn {
+	if isWrite {
+		return sap.Pool.Get()
+	} else {
+		return sap.ReadPool.Get()
 	}
 }
 
