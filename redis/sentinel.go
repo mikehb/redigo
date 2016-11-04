@@ -12,6 +12,9 @@ import (
 type SentinelClient struct {
 	mu      sync.Mutex
 	SentinelAddrs  []string
+	// If not empty, remote slave redis instance is not accessed until all these redis intances are unavailable
+	// This is useful in settings with multiple data centers
+	RedisAddrs []string
 	net            string
 	Conn           Conn
 	ElectSentinel  func([]string) int
@@ -34,7 +37,7 @@ type SentinelClient struct {
 // Note that in a worst-case scenario, the timeout for performing an
 // operation with a SentinelClient wrapper method may take (# sentinels) *
 // timeout to test and connect to the various configured addresses.
-func NewSentinelClient(net string, addrs []string, electSentinel func([]string) int,
+func NewSentinelClient(net string, addrs []string, redisAddrs []string, electSentinel func([]string) int,
 	connectTimeout, readTimeout, writeTimeout time.Duration) (*SentinelClient, error) {
 	if electSentinel == nil {
 		electSentinel = fallbackElectSentinel
@@ -42,6 +45,7 @@ func NewSentinelClient(net string, addrs []string, electSentinel func([]string) 
 	sc := &SentinelClient{
 		net:            net,
 		SentinelAddrs:  addrs,
+		RedisAddrs: redisAddrs,
 		ElectSentinel:  electSentinel,
 		connectTimeout: connectTimeout,
 		readTimeout:    readTimeout,
@@ -222,6 +226,35 @@ func (sc *SentinelClient) DialSlave(name string, options ...DialOption) (Conn, e
 	if err != nil {
 		return nil, err
 	}
+	var index, slaveIndex int32
+	var flags map[string]bool
+	var i int
+	if len(sc.RedisAddrs) > 0 {
+		redisAddrs := sc.RedisAddrs
+		for len(redisAddrs) > 0 {
+			index = rand.Int31n(int32(len(redisAddrs)))
+			slaveIndex = -1
+			for i, _ = range slaves {
+				if SlaveAddr(slaves[i]) == redisAddrs[index] {
+					slaveIndex = int32(i)
+					break
+				}
+			}
+			if slaveIndex == -1 {
+				continue
+			}
+			flags = SlaveReadFlags(slaves[slaveIndex])
+			if slaves[slaveIndex]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+				conn, err := Dial(sc.net, redisAddrs[index], options...)
+				if err == nil {
+					return conn, err
+				}
+			}
+			redisAddrs = append(redisAddrs[:index], redisAddrs[index+1:]...)
+			slaves = append(slaves[:slaveIndex], slaves[slaveIndex+1:]...)
+		}
+	}
+
 	for len(slaves) > 0 {
 		index := rand.Int31n(int32(len(slaves)))
 		flags := SlaveReadFlags(slaves[index])
@@ -246,11 +279,53 @@ func (sc *SentinelClient) DialAny(name string, options ...DialOption) (Conn, err
 		return nil, err
 	}
 
-	for {
-		index := rand.Int31n(int32(len(slaves) + 1))
+	var index, slaveIndex int32
+	var flags map[string]bool
+	var i int
+	if len(sc.RedisAddrs) > 0 {
+		redisAddrs := sc.RedisAddrs
+		for len(redisAddrs) > 0 {
+			index = rand.Int31n(int32(len(redisAddrs)))
+			slaveIndex = -1
+			for i, _ = range slaves {
+				if SlaveAddr(slaves[i]) == redisAddrs[index] {
+					slaveIndex = int32(i)
+					break
+				}
+			}
+			if slaveIndex >= 0 {
+				flags = SlaveReadFlags(slaves[slaveIndex])
+			}
+			if slaveIndex == -1 ||
+				slaves[slaveIndex]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+				conn, err := Dial(sc.net, redisAddrs[index], options...)
+				if err == nil {
+					return conn, err
+				}
+			}
+			redisAddrs = append(redisAddrs[:index], redisAddrs[index+1:]...)
+			if slaveIndex >= 0 {
+				slaves = append(slaves[:slaveIndex], slaves[slaveIndex+1:]...)
+			}
+		}
+	}
+
+	var masterFailed bool = false
+
+	for len(slaves) > 0 || !masterFailed {
+		if !masterFailed {
+			index = rand.Int31n(int32(len(slaves) + 1))
+		} else {
+			index = rand.Int31n(int32(len(slaves)))
+		}
 		// This is the master
 		if int(index) == len(slaves) {
-			return sc.DialMaster(name, options...)
+			conn, err := sc.DialMaster(name, options...)
+			if err == nil {
+				return conn, err
+			}
+			masterFailed = true
+			continue
 		}
 
 		flags := SlaveReadFlags(slaves[index])
