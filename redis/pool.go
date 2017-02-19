@@ -21,6 +21,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"io"
+	"net"
 	"strconv"
 	"sync"
 	"time"
@@ -39,6 +40,17 @@ var (
 	errPoolClosed = errors.New("redigo: connection pool closed")
 	errConnClosed = errors.New("redigo: connection closed")
 )
+
+// Redis path selector types
+const (
+	RPSFixed = iota
+	RPSLeastOutstanding = iota
+)
+
+type redisPath struct {
+	addr string					// address of this redis server
+	outstanding uint32
+}
 
 // Pool maintains a pool of connections. The application calls the Get method
 // to get a connection from the pool and the connection's Close method to
@@ -100,6 +112,8 @@ type Pool struct {
 	// (subscribed to pubsub channel, transaction started, ...).
 	Dial func() (Conn, error)
 
+	DialDirect func(redisAddr string) (Conn, error)
+	
 	// TestOnBorrow is an optional application supplied function for checking
 	// the health of an idle connection before the connection is used again by
 	// the application. Argument t is the time that the connection was returned
@@ -151,7 +165,16 @@ func NewPool(newFn func() (Conn, error), maxIdle int) *Pool {
 // getting an underlying connection, then the connection Err, Do, Send, Flush
 // and Receive methods return that error.
 func (p *Pool) Get() Conn {
-	c, err := p.get()
+	redisAddr := ""
+	c, err := p.get(redisAddr)
+	if err != nil {
+		return errorConnection{err}
+	}
+	return &pooledConnection{p: p, c: c}
+}
+
+func (p *Pool) GetByPrefer(redisAddr string) Conn {
+	c, err := p.get(redisAddr)
 	if err != nil {
 		return errorConnection{err}
 	}
@@ -199,11 +222,10 @@ func (p *Pool) release() {
 
 // get prunes stale connections and returns a connection from the idle list or
 // creates a new connection.
-func (p *Pool) get() (Conn, error) {
+func (p *Pool) get(redisAddr string) (Conn, error) {
 	p.mu.Lock()
 
 	// Prune stale connections.
-
 	if timeout := p.IdleTimeout; timeout > 0 {
 		for i, n := 0, p.idle.Len(); i < n; i++ {
 			e := p.idle.Back()
@@ -223,15 +245,14 @@ func (p *Pool) get() (Conn, error) {
 	}
 
 	for {
-
 		// Get idle connection.
-
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Front()
-			if e == nil {
-				break
-			}
+		var next *list.Element
+		for e := p.idle.Front(); e != nil; e = next {
+			next = e.Next()
 			ic := e.Value.(idleConn)
+			if redisAddr != "" && ic.c.RemoteAddr().String() != redisAddr {
+				continue
+			}
 			p.idle.Remove(e)
 			test := p.TestOnBorrow
 			p.mu.Unlock()
@@ -244,25 +265,37 @@ func (p *Pool) get() (Conn, error) {
 		}
 
 		// Check for pool closed before dialing a new connection.
-
 		if p.closed {
 			p.mu.Unlock()
 			return nil, errors.New("redigo: get on closed pool")
 		}
 
 		// Dial new connection if under limit.
-
 		if p.MaxActive == 0 || p.active < p.MaxActive {
 			dial := p.Dial
+			dialDirect := p.DialDirect
 			p.active += 1
 			p.mu.Unlock()
-			c, err := dial()
+			var c Conn
+			var err error
+			if redisAddr != "" {
+				c, err = dialDirect(redisAddr)
+			} else {
+				c, err = dial()
+			}
 			if err != nil {
 				p.mu.Lock()
 				p.release()
 				p.mu.Unlock()
+				// Try other redis connection if dialing the prefered redis failed
+				if redisAddr != "" {
+					redisAddr = ""
+					p.mu.Lock()
+					continue
+				}
 				c = nil
 			}
+
 			return c, err
 		}
 
@@ -382,6 +415,9 @@ func (p *Pool) putCommon(err error, c Conn, forceClose bool) error {
 // contacted, it may be impossible to dial for some time. The
 // SentinelClient should automatically recover once a sentinel returns.
 type SentinelAwarePool struct {
+	RedisSet string				// the name of redis set
+	SentClient *SentinelClient
+	SentBClient *SentinelClient
 	Pool						// redis pool for master redis
 	ReadPool Pool				// redis pool for any redis instance
 	// TestOnReturn is a user-supplied function to test a connection before
@@ -392,6 +428,12 @@ type SentinelAwarePool struct {
 	TestOnReturn func(c Conn) error
 
 	masterAddr string
+
+	// The redis path selector
+	RedisPathSelector int
+	nextRedisPath int
+	redisPaths []redisPath
+	mu sync.Mutex
 }
 
 // UpdateMaster updates the internal accounting of the SentinelAwarePool,
@@ -403,15 +445,158 @@ func (sap *SentinelAwarePool) UpdateMaster(addr string) {
 		sap.closeAll()
 		sap.ReadPool.closeAll()
 	}
+ }
+
+func (sap *SentinelAwarePool) ProbeRedisPaths() {
+	var rp redisPath
+	psc := PubSubConn{Conn: Conn(sap.SentBClient)}
+	psc.Subscribe("+reset-master")
+	psc.Subscribe("+slave")
+	psc.Subscribe("+sdown")
+	psc.Subscribe("-sdown")
+	psc.Subscribe("+odown")
+	psc.Subscribe("-odown")
+	for {
+		switch psc.Receive().(type) {
+		case Message:
+			redisPaths := make([]redisPath, 0)
+			masterAddr, err := sap.SentClient.QueryConfForMaster(sap.RedisSet)
+			if err == nil {
+				rp.addr = masterAddr
+				rp.outstanding = 0
+				sap.mu.Lock()
+				for i, _ := range sap.redisPaths {
+					if sap.redisPaths[i].addr == masterAddr {
+						// Save the previous outstanding
+						rp.outstanding = sap.redisPaths[i].outstanding
+						break
+					}
+				}
+				sap.mu.Unlock()
+				redisPaths = append(redisPaths, rp)
+			}
+			slaves, err := sap.SentClient.QueryConfForSlaves(sap.RedisSet)
+			if err == nil {
+				for i, _ := range slaves {
+					flags := SlaveReadFlags(slaves[i])
+					if slaves[i]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+						rp.addr = SlaveAddr(slaves[i])
+						rp.outstanding = 0
+						sap.mu.Lock()
+						for j, _ := range sap.redisPaths {
+							if sap.redisPaths[j].addr == SlaveAddr(slaves[i]) {
+								// Save the previous outstanding
+								rp.outstanding = sap.redisPaths[j].outstanding
+								break
+							}
+						}
+						sap.mu.Unlock()
+						redisPaths = append(redisPaths, rp)
+					}
+				}
+			}
+
+			sap.mu.Lock()
+			sap.redisPaths = redisPaths
+			sap.mu.Unlock()
+			
+		case  error:
+			// Wait till a good sentinel is conntected.
+			for {
+				if err := sap.SentBClient.Dial(); err != nil {
+					// if no good one, sleep a moment for avoiding making system busy
+					time.Sleep(100 * time.Millisecond)
+				} else {
+					break
+				}
+			}
+		}
+	}
 }
 
-// Get returns a redis connection to either master redis or any redis instance
-func (sap *SentinelAwarePool) Get(isWrite bool) Conn {
-	if isWrite {
-		return sap.Pool.Get()
-	} else {
-		return sap.ReadPool.Get()
+func (sap *SentinelAwarePool) InitRedisPathSelector() {
+	if sap.RedisPathSelector != RPSLeastOutstanding {
+		return
 	}
+	
+	sap.nextRedisPath = 0
+	sap.redisPaths = make([]redisPath, 0)
+	masterAddr, err := sap.SentClient.QueryConfForMaster(sap.RedisSet)
+	if err == nil {
+		sap.redisPaths = append(sap.redisPaths, redisPath{addr: masterAddr, outstanding: 0})
+	}
+	slaves, err := sap.SentClient.QueryConfForSlaves(sap.RedisSet)
+	if err == nil {
+		for i, _ := range slaves {
+			flags := SlaveReadFlags(slaves[i])
+			if slaves[i]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+				sap.redisPaths = append(sap.redisPaths, redisPath{addr: SlaveAddr(slaves[i]), outstanding: 0})
+			}
+		}
+	}
+
+	// Detect redis path
+	go sap.ProbeRedisPaths()
+}
+
+// Get returns a redis connection to either master redis or any redis instance with load balance under consideration
+func (sap *SentinelAwarePool) Get(isWrite bool) (c Conn) {
+	// Pick the path with least outstanding requests
+	redisAddr := ""
+	if sap.RedisPathSelector == RPSLeastOutstanding {
+		minOutstanding := uint32(0xFFFFFFFF)
+		minIndex := -1
+		sap.mu.Lock()
+		i := sap.nextRedisPath
+		for {
+			if sap.redisPaths[i].outstanding < minOutstanding {
+				redisAddr = sap.redisPaths[i].addr
+				minOutstanding = sap.redisPaths[i].outstanding
+				minIndex = i
+			}
+			i = (i + 1) % len(sap.redisPaths)
+			if i == sap.nextRedisPath {
+				break
+			}
+		}
+		if minIndex >= 0 {
+			sap.redisPaths[minIndex].outstanding++
+		}
+		// go to the next path for avoiding always picking the same path
+		sap.nextRedisPath = (sap.nextRedisPath + 1) % len(sap.redisPaths)
+		sap.mu.Unlock()
+	}
+
+	if isWrite {
+		c = sap.Pool.Get()
+	} else {
+		// Get the prefer redis connection from the pool
+		c = sap.ReadPool.GetByPrefer(redisAddr)
+	}
+
+	if sap.RedisPathSelector == RPSLeastOutstanding {
+		remoteAddr := c.RemoteAddr().String()
+		c.(*pooledConnection).postClose = func() {
+			sap.mu.Lock()
+			found := false
+			for i, _ := range sap.redisPaths {
+				if sap.redisPaths[i].addr == redisAddr {
+					// reduce the outstanding accessing
+					sap.redisPaths[i].outstanding--
+				}
+				if sap.redisPaths[i].addr == remoteAddr {
+					found = true
+				}
+			}
+			// New path was inserted
+			if !found {
+				sap.redisPaths = append(sap.redisPaths, redisPath{addr: remoteAddr})
+			}
+			sap.mu.Unlock()
+		}
+	}
+	
+	return
 }
 
 // Entrypoint for TestOnReturn, any error here causes the connection to be
@@ -439,6 +624,7 @@ type pooledConnection struct {
 	p     connToPool
 	c     Conn
 	state int
+	postClose func()
 }
 
 var (
@@ -493,6 +679,9 @@ func (pc *pooledConnection) Close() error {
 	}
 	c.Do("")
 	pc.p.put(c, pc.state != 0)
+	if pc.postClose != nil {
+		pc.postClose()
+	}
 	return nil
 }
 
@@ -520,6 +709,14 @@ func (pc *pooledConnection) Receive() (reply interface{}, err error) {
 	return pc.c.Receive()
 }
 
+func (pc *pooledConnection) LocalAddr() net.Addr {
+	return pc.c.LocalAddr()
+}
+
+func (pc *pooledConnection) RemoteAddr() net.Addr {
+	return pc.c.RemoteAddr()
+}
+
 type errorConnection struct{ err error }
 
 func (ec errorConnection) Do(string, ...interface{}) (interface{}, error) { return nil, ec.err }
@@ -528,3 +725,5 @@ func (ec errorConnection) Err() error                                     { retu
 func (ec errorConnection) Close() error                                   { return ec.err }
 func (ec errorConnection) Flush() error                                   { return ec.err }
 func (ec errorConnection) Receive() (interface{}, error)                  { return nil, ec.err }
+func (ec errorConnection) LocalAddr() net.Addr                            { return nil }
+func (ec errorConnection) RemoteAddr() net.Addr                           { return nil }

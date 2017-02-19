@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,8 @@ func NewSentinelClient(net string, addrs []string, redisAddrs []string, electSen
 	connectTimeout, readTimeout, writeTimeout time.Duration) (*SentinelClient, error) {
 	if electSentinel == nil {
 		electSentinel = fallbackElectSentinel
+	} else {
+		rand.Seed(time.Now().UnixNano())
 	}
 	sc := &SentinelClient{
 		net:            net,
@@ -61,6 +64,7 @@ func NewSentinelClient(net string, addrs []string, redisAddrs []string, electSen
 // The default ElectSentinel implementation, just elects the first sentinel
 // in the list every time.
 func fallbackElectSentinel(addrs []string) int {
+	fmt.Printf("fallbackElectSentinel was called\n")
 	return 0
 }
 
@@ -175,6 +179,14 @@ func (sc *SentinelClient) QueryConfForSlaves(name string) ([]map[string]string, 
 	return slaves, err
 }
 
+func (sc *SentinelClient) LocalAddr() net.Addr {
+	return sc.Conn.LocalAddr()
+}
+
+func (sc *SentinelClient) RemoteAddr() net.Addr {
+	return sc.Conn.RemoteAddr()
+}
+
 // A convenience function which formats only the relevant parts of a single
 // slave map[string]string into an address ip:port pair.
 func SlaveAddr(slaveMap map[string]string) string {
@@ -229,7 +241,7 @@ func (sc *SentinelClient) DialSlave(name string, options ...DialOption) (Conn, e
 	var index, slaveIndex int32
 	var flags map[string]bool
 	var i int
-	if len(sc.RedisAddrs) > 0 {
+ 	if len(sc.RedisAddrs) > 0 {
 		redisAddrs := sc.RedisAddrs
 		for len(redisAddrs) > 0 {
 			index = rand.Int31n(int32(len(redisAddrs)))
@@ -338,6 +350,10 @@ func (sc *SentinelClient) DialAny(name string, options ...DialOption) (Conn, err
 		slaves = append(slaves[:index], slaves[index+1:]...)
 	}
 	return nil, InternalError
+}
+
+func (sc *SentinelClient) DialDirect(redisAddr string, options ...DialOption) (Conn, error) {
+	return Dial(sc.net, redisAddr, options...)
 }
 
 // Exposes the Close of the underlying Conn

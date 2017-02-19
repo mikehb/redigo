@@ -14,6 +14,8 @@
 
 package redis
 
+import "net"
+
 // Error represents an error returned in a command reply.
 type Error string
 
@@ -41,4 +43,7 @@ type Conn interface {
 
 	// Receive receives a single reply from the Redis server
 	Receive() (reply interface{}, err error)
+
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
 }

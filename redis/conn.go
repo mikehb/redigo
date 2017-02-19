@@ -515,6 +515,14 @@ func (c *conn) Receive() (reply interface{}, err error) {
 	return
 }
 
+func (c *conn) LocalAddr() net.Addr {
+	return c.conn.LocalAddr()
+}
+
+func (c *conn) RemoteAddr() net.Addr {
+	return c.conn.RemoteAddr()
+}
+
 func (c *conn) Do(cmd string, args ...interface{}) (interface{}, error) {
 	c.mu.Lock()
 	pending := c.pending
