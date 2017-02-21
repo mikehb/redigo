@@ -64,7 +64,6 @@ func NewSentinelClient(net string, addrs []string, redisAddrs []string, electSen
 // The default ElectSentinel implementation, just elects the first sentinel
 // in the list every time.
 func fallbackElectSentinel(addrs []string) int {
-	fmt.Printf("fallbackElectSentinel was called\n")
 	return 0
 }
 
