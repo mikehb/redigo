@@ -418,6 +418,56 @@ func (sc *SentinelClient) Receive() (reply interface{}, err error) {
 	return sc.Conn.Receive()
 }
 
+
+// Probe the good redis paths
+func (sc *SentinelClient) Probe(name string) ([]string, error) {
+	slaves, err := sc.QueryConfForSlaves(name)
+	if err != nil {
+		return nil, err
+	}
+
+	redisPaths := make([]string, 0)
+
+	var index, slaveIndex int
+	var flags map[string]bool
+	var i int
+	if len(sc.RedisAddrs) > 0 {
+		redisAddrs := sc.RedisAddrs
+		for index = 0; index < len(redisAddrs); index++ {
+			slaveIndex = -1
+			for i, _ = range slaves {
+				if SlaveAddr(slaves[i]) == redisAddrs[index] {
+					slaveIndex = i
+					break
+				}
+			}
+			if slaveIndex >= 0 {
+				flags = SlaveReadFlags(slaves[slaveIndex])
+			}
+			if slaveIndex == -1 ||
+				slaves[slaveIndex]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+				redisPaths = append(redisPaths, redisAddrs[index])
+			}
+		}
+		if len(redisPaths) > 0 {
+			return redisPaths, nil
+		}
+	}
+
+	masterAddr, err := sc.QueryConfForMaster(name)
+	if err == nil {
+		redisPaths = append(redisPaths, masterAddr)
+	}
+
+	for i, _ := range slaves {
+		flags := SlaveReadFlags(slaves[i])
+		if slaves[i]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+			redisPaths = append(redisPaths, SlaveAddr(slaves[i]))
+		}
+	}
+	return redisPaths, nil
+}
+
 // GetRole is a convenience function supplied to query an instance (master or
 // slave) for its role. It attempts to use the ROLE command introduced in
 // redis 2.8.12. Failing this, the INFO replication command is used instead.

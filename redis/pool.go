@@ -17,11 +17,12 @@ package redis
 import (
 	"bytes"
 	"container/list"
-	"crypto/rand"
 	"crypto/sha1"
 	"errors"
 	"io"
+	"math/rand"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -447,58 +448,106 @@ func (sap *SentinelAwarePool) UpdateMaster(addr string) {
 	}
  }
 
-func (sap *SentinelAwarePool) ProbeRedisPaths() {
+func (sap *SentinelAwarePool) _probeRedisPaths() {
+	var err error
+	var redisPaths []redisPath
+	var redisAddrs []string
 	var rp redisPath
-	psc := PubSubConn{Conn: Conn(sap.SentBClient)}
-	psc.Subscribe("+reset-master")
-	psc.Subscribe("+slave")
-	psc.Subscribe("+sdown")
-	psc.Subscribe("-sdown")
-	psc.Subscribe("+odown")
-	psc.Subscribe("-odown")
-	for {
-		switch psc.Receive().(type) {
-		case Message:
-			redisPaths := make([]redisPath, 0)
-			masterAddr, err := sap.SentClient.QueryConfForMaster(sap.RedisSet)
-			if err == nil {
-				rp.addr = masterAddr
+	
+	redisAddrs, err = sap.SentClient.Probe(sap.RedisSet)
+	if err == nil {
+		sap.mu.Lock()
+		for i, _ := range redisAddrs {
+			rp.addr = redisAddrs[i]
+			rp.outstanding = 0
+			for j, _ := range sap.redisPaths {
+				if sap.redisPaths[j].addr == redisAddrs[i] {
+					// Save the previous outstanding
+					rp.outstanding = sap.redisPaths[j].outstanding
+					break
+				}
+			}
+			redisPaths = append(redisPaths, rp)
+		}
+		sap.redisPaths = redisPaths
+		if len(redisPaths) > 0 {
+			sap.nextRedisPath = int(rand.Int31n(int32(len(redisPaths))))
+		} else {
+			sap.nextRedisPath = -1
+		}
+		sap.mu.Unlock()
+	}
+	return
+
+	
+
+	redisPaths = make([]redisPath, 0)
+	masterAddr, err1 := sap.SentClient.QueryConfForMaster(sap.RedisSet)
+	slaves, err2 := sap.SentClient.QueryConfForSlaves(sap.RedisSet)
+	
+	sap.mu.Lock()
+	if err1 == nil {
+		rp.addr = masterAddr
+		rp.outstanding = 0
+		for i, _ := range sap.redisPaths {
+			if sap.redisPaths[i].addr == masterAddr {
+				// Save the previous outstanding
+				rp.outstanding = sap.redisPaths[i].outstanding
+				break
+			}
+		}
+		redisPaths = append(redisPaths, rp)
+	}
+	if err2 == nil {
+		for i, _ := range slaves {
+			flags := SlaveReadFlags(slaves[i])
+			if slaves[i]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
+				rp.addr = SlaveAddr(slaves[i])
 				rp.outstanding = 0
-				sap.mu.Lock()
-				for i, _ := range sap.redisPaths {
-					if sap.redisPaths[i].addr == masterAddr {
+				for j, _ := range sap.redisPaths {
+					if sap.redisPaths[j].addr == SlaveAddr(slaves[i]) {
 						// Save the previous outstanding
-						rp.outstanding = sap.redisPaths[i].outstanding
+						rp.outstanding = sap.redisPaths[j].outstanding
 						break
 					}
 				}
-				sap.mu.Unlock()
 				redisPaths = append(redisPaths, rp)
 			}
-			slaves, err := sap.SentClient.QueryConfForSlaves(sap.RedisSet)
-			if err == nil {
-				for i, _ := range slaves {
-					flags := SlaveReadFlags(slaves[i])
-					if slaves[i]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
-						rp.addr = SlaveAddr(slaves[i])
-						rp.outstanding = 0
-						sap.mu.Lock()
-						for j, _ := range sap.redisPaths {
-							if sap.redisPaths[j].addr == SlaveAddr(slaves[i]) {
-								// Save the previous outstanding
-								rp.outstanding = sap.redisPaths[j].outstanding
-								break
-							}
-						}
-						sap.mu.Unlock()
-						redisPaths = append(redisPaths, rp)
-					}
-				}
-			}
+		}
+	}
 
-			sap.mu.Lock()
-			sap.redisPaths = redisPaths
-			sap.mu.Unlock()
+	sap.redisPaths = redisPaths
+	if len(redisPaths) > 0 {
+		sap.nextRedisPath = int(rand.Int31n(int32(len(redisPaths))))
+	} else {
+		sap.nextRedisPath = -1
+	}
+	sap.mu.Unlock()
+}
+
+func (sap *SentinelAwarePool) ProbeRedisPaths() {
+	// Add a timer to probe the redis paths, in case that it may miss the published message
+	var t *time.Timer
+	go func() {
+		for {
+			t = time.NewTimer(30 * time.Second)
+			select {
+				case <- t.C:
+				sap._probeRedisPaths()
+			}
+		}
+	} ()
+
+	psc := PubSubConn{Conn: Conn(sap.SentBClient)}
+	psc.PSubscribe("*sdown")
+	psc.PSubscribe("*odown")
+	psc.PSubscribe("*role-change")
+	psc.PSubscribe("*failover*")
+	psc.PSubscribe("*slave**")
+	for {
+		switch psc.Receive().(type) {
+		case PMessage:
+			sap._probeRedisPaths()
 			
 		case  error:
 			// Wait till a good sentinel is conntected.
@@ -518,8 +567,7 @@ func (sap *SentinelAwarePool) InitRedisPathSelector() {
 	if sap.RedisPathSelector != RPSLeastOutstanding {
 		return
 	}
-	
-	sap.nextRedisPath = 0
+
 	sap.redisPaths = make([]redisPath, 0)
 	masterAddr, err := sap.SentClient.QueryConfForMaster(sap.RedisSet)
 	if err == nil {
@@ -533,6 +581,13 @@ func (sap *SentinelAwarePool) InitRedisPathSelector() {
 				sap.redisPaths = append(sap.redisPaths, redisPath{addr: SlaveAddr(slaves[i]), outstanding: 0})
 			}
 		}
+		if len(sap.redisPaths) > 0 {
+			sap.nextRedisPath = int(rand.Int31n(int32(len(sap.redisPaths))))
+		} else {
+			sap.nextRedisPath = -1
+		}
+	} else {
+		sap.nextRedisPath = -1
 	}
 
 	// Detect redis path
@@ -543,7 +598,7 @@ func (sap *SentinelAwarePool) InitRedisPathSelector() {
 func (sap *SentinelAwarePool) Get(isWrite bool) (c Conn) {
 	// Pick the path with least outstanding requests
 	redisAddr := ""
-	if sap.RedisPathSelector == RPSLeastOutstanding {
+	if sap.RedisPathSelector == RPSLeastOutstanding && sap.nextRedisPath >= 0 {
 		minOutstanding := uint32(0xFFFFFFFF)
 		minIndex := -1
 		sap.mu.Lock()
@@ -575,24 +630,23 @@ func (sap *SentinelAwarePool) Get(isWrite bool) (c Conn) {
 	}
 
 	if sap.RedisPathSelector == RPSLeastOutstanding {
-		remoteAddr := c.RemoteAddr().String()
-		c.(*pooledConnection).postClose = func() {
-			sap.mu.Lock()
-			found := false
-			for i, _ := range sap.redisPaths {
-				if sap.redisPaths[i].addr == redisAddr {
-					// reduce the outstanding accessing
-					sap.redisPaths[i].outstanding--
+		pc, ok := c.(*pooledConnection)
+		if ok {
+			pc.postClose = func() {
+				sap.mu.Lock()
+				for i, _ := range sap.redisPaths {
+					if sap.redisPaths[i].addr == redisAddr {
+						// reduce the outstanding accessing
+						// outstanding may be zero if _probeRedisPath was executed multiple times.
+						// First outstanding is increased 1, later this path was removed and added by _probeRedisPath.
+						if sap.redisPaths[i].outstanding > 0 {
+							sap.redisPaths[i].outstanding--
+						}
+						break
+					}
 				}
-				if sap.redisPaths[i].addr == remoteAddr {
-					found = true
-				}
+				sap.mu.Unlock()
 			}
-			// New path was inserted
-			if !found {
-				sap.redisPaths = append(sap.redisPaths, redisPath{addr: remoteAddr})
-			}
-			sap.mu.Unlock()
 		}
 	}
 	
