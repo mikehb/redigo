@@ -22,7 +22,6 @@ import (
 	"io"
 	"math/rand"
 	"net"
-	"runtime"
 	"strconv"
 	"sync"
 	"time"
