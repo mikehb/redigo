@@ -476,52 +476,6 @@ func (sap *SentinelAwarePool) _probeRedisPaths() {
 		}
 		sap.mu.Unlock()
 	}
-	return
-
-	
-
-	redisPaths = make([]redisPath, 0)
-	masterAddr, err1 := sap.SentClient.QueryConfForMaster(sap.RedisSet)
-	slaves, err2 := sap.SentClient.QueryConfForSlaves(sap.RedisSet)
-	
-	sap.mu.Lock()
-	if err1 == nil {
-		rp.addr = masterAddr
-		rp.outstanding = 0
-		for i, _ := range sap.redisPaths {
-			if sap.redisPaths[i].addr == masterAddr {
-				// Save the previous outstanding
-				rp.outstanding = sap.redisPaths[i].outstanding
-				break
-			}
-		}
-		redisPaths = append(redisPaths, rp)
-	}
-	if err2 == nil {
-		for i, _ := range slaves {
-			flags := SlaveReadFlags(slaves[i])
-			if slaves[i]["master-link-status"] == "ok" && !(flags["disconnected"] || flags["sdown"]) {
-				rp.addr = SlaveAddr(slaves[i])
-				rp.outstanding = 0
-				for j, _ := range sap.redisPaths {
-					if sap.redisPaths[j].addr == SlaveAddr(slaves[i]) {
-						// Save the previous outstanding
-						rp.outstanding = sap.redisPaths[j].outstanding
-						break
-					}
-				}
-				redisPaths = append(redisPaths, rp)
-			}
-		}
-	}
-
-	sap.redisPaths = redisPaths
-	if len(redisPaths) > 0 {
-		sap.nextRedisPath = int(rand.Int31n(int32(len(redisPaths))))
-	} else {
-		sap.nextRedisPath = -1
-	}
-	sap.mu.Unlock()
 }
 
 func (sap *SentinelAwarePool) ProbeRedisPaths() {
