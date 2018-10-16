@@ -252,6 +252,7 @@ func (sc *SentinelClient) DialSlave(name string, options ...DialOption) (Conn, e
 				}
 			}
 			if slaveIndex == -1 {
+				redisAddrs = append(redisAddrs[:index], redisAddrs[index+1:]...)
 				continue
 			}
 			flags = SlaveReadFlags(slaves[slaveIndex])

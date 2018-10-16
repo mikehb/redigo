@@ -431,8 +431,14 @@ type SentinelAwarePool struct {
 
 	// The redis path selector
 	RedisPathSelector int
+
+	// Local redis addr 
+	redisLocalPaths []string
+
+	// All alive redis path
 	nextRedisPath int
 	redisPaths []redisPath
+
 	mu sync.Mutex
 }
 
@@ -547,37 +553,58 @@ func (sap *SentinelAwarePool) InitRedisPathSelector() {
 	go sap.ProbeRedisPaths()
 }
 
+func (sap *SentinelAwarePool) InitLocalServers(servers []string) {
+	sap.redisLocalPaths = make([]string,0)
+	for server := range servers {
+		sap.redisLocalPaths = append(sap.redisLocalPaths, server)	
+	}
+}
+
 // Get returns a redis connection to either master redis or any redis instance with load balance under consideration
 func (sap *SentinelAwarePool) Get(isWrite bool) (c Conn) {
 	// Pick the path with least outstanding requests
 	redisAddr := ""
-	if sap.RedisPathSelector == RPSLeastOutstanding && sap.nextRedisPath >= 0 {
-		minOutstanding := uint32(0xFFFFFFFF)
-		minIndex := -1
-		sap.mu.Lock()
-		i := sap.nextRedisPath
-		for {
-			if sap.redisPaths[i].outstanding < minOutstanding {
-				redisAddr = sap.redisPaths[i].addr
-				minOutstanding = sap.redisPaths[i].outstanding
-				minIndex = i
-			}
-			i = (i + 1) % len(sap.redisPaths)
-			if i == sap.nextRedisPath {
-				break
-			}
-		}
-		if minIndex >= 0 {
-			sap.redisPaths[minIndex].outstanding++
-		}
-		// go to the next path for avoiding always picking the same path
-		sap.nextRedisPath = (sap.nextRedisPath + 1) % len(sap.redisPaths)
-		sap.mu.Unlock()
-	}
-
 	if isWrite {
 		c = sap.Pool.Get()
 	} else {
+		// Pick path from all alive slaves, redisPaths is kept alive by probe function
+		if sap.RedisPathSelector == RPSLeastOutstanding && sap.nextRedisPath >= 0 {
+			minOutstanding := uint32(0xFFFFFFFF)
+			minIndex := -1
+			minLocalOutstanding := uint32(0xFFFFFFFF)
+			minLocalIndex := -1
+			sap.mu.Lock()
+			i := sap.nextRedisPath
+			for {
+				if inLocalPath(sap.redisPaths[i].addr, sap.redisLocalPaths) {
+					if sap.redisPaths[i].outstanding < minLocalOutstanding {
+						minLocalOutstanding = sap.redisPaths[i].outstanding
+						minLocalIndex = i
+					}
+				} else {
+					if sap.redisPaths[i].outstanding < minOutstanding {
+						minOutstanding = sap.redisPaths[i].outstanding
+						minIndex = i
+					}
+				}
+				i = (i + 1) % len(sap.redisPaths)
+				if i == sap.nextRedisPath {
+					if minLocalIndex >= 0 {
+						redisAddr = sap.redisPaths[minLocalIndex].addr
+					} else if minIndex >= 0 {
+						redisAddr = sap.redisPaths[minIndex].addr
+					}
+					break
+				}
+			}
+			if minIndex >= 0 {
+				sap.redisPaths[minIndex].outstanding++
+			}
+			// go to the next path for avoiding always picking the same path
+			sap.nextRedisPath = (sap.nextRedisPath + 1) % len(sap.redisPaths)
+			sap.mu.Unlock()
+		}
+
 		// Get the prefer redis connection from the pool
 		c = sap.ReadPool.GetByPrefer(redisAddr)
 	}
@@ -604,6 +631,15 @@ func (sap *SentinelAwarePool) Get(isWrite bool) (c Conn) {
 	}
 	
 	return
+}
+
+func inLocalPath(redisAddr string, localRedis []redisPath) (bool) {
+	for redis := range localRedis {
+		if redis.addr == redisAddr {
+			return true
+		}
+	}
+	return false
 }
 
 // Entrypoint for TestOnReturn, any error here causes the connection to be
