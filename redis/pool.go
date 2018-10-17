@@ -555,7 +555,7 @@ func (sap *SentinelAwarePool) InitRedisPathSelector() {
 
 func (sap *SentinelAwarePool) InitLocalServers(servers []string) {
 	sap.redisLocalPaths = make([]string,0)
-	for server := range servers {
+	for _, server := range servers {
 		sap.redisLocalPaths = append(sap.redisLocalPaths, server)	
 	}
 }
@@ -633,9 +633,9 @@ func (sap *SentinelAwarePool) Get(isWrite bool) (c Conn) {
 	return
 }
 
-func inLocalPath(redisAddr string, localRedis []redisPath) (bool) {
-	for redis := range localRedis {
-		if redis.addr == redisAddr {
+func inLocalPath(redisAddr string, redisLocalPaths []string) (bool) {
+	for _, redisPath := range redisLocalPaths {
+		if redisPath == redisAddr {
 			return true
 		}
 	}
